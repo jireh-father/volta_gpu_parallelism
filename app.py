@@ -52,6 +52,12 @@ if torch.cuda.get_device_capability()[0] >= 7:  # Volta 이상
     model = model.half()  # FP16 변환
 
 # ImageNet 클래스 레이블 로딩
+import os
+if not os.path.exists('imagenet_classes.txt'):
+    url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
+    response = requests.get(url)
+    with open('imagenet_classes.txt', 'w') as f:
+        f.write(response.text)
 with open('imagenet_classes.txt', 'r') as f:
     categories = [s.strip() for s in f.readlines()]
 
@@ -152,12 +158,7 @@ async def startup_event():
     torch.cuda.empty_cache()
     
     # ImageNet 클래스 파일 다운로드 (없는 경우)
-    import os
-    if not os.path.exists('imagenet_classes.txt'):
-        url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
-        response = requests.get(url)
-        with open('imagenet_classes.txt', 'w') as f:
-            f.write(response.text)
+    
 
 if __name__ == "__main__":
     import uvicorn
