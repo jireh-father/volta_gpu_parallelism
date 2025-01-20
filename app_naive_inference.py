@@ -175,6 +175,11 @@ def predict():
             # 결과 대기
             result = selected_queue.get()
             
+            # 결과가 문자열인 경우 (에러 메시지)
+            if isinstance(result, str):
+                return jsonify({"error": result}), 500
+            
+            # 결과가 딕셔너리인 경우 (정상 결과)
             if result.get("success", False):
                 return jsonify({
                     "predictions": result["predictions"],
