@@ -9,6 +9,8 @@ from multiprocessing import Process, Queue, cpu_count
 import numpy as np
 import os
 import argparse
+import atexit
+import signal
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Flask 기반 멀티프로세스 추론 서버')
@@ -22,13 +24,12 @@ args = parse_args()
 NUM_WORKERS = args.num_workers  # 사용자 지정 워커 수 사용
 
 # 워커 프로세스와 큐 초기화
-request_queues = [Queue() for _ in range(NUM_WORKERS)]
-response_queue = Queue()
+request_queues = []
 processes = []
 
 def initialize_workers():
     """워커 프로세스들을 초기화합니다."""
-    global processes
+    global processes, request_queues
     
     # ImageNet 클래스 파일 다운로드 (없는 경우)
     if not os.path.exists('imagenet_classes.txt'):
@@ -37,11 +38,46 @@ def initialize_workers():
         with open('imagenet_classes.txt', 'w') as f:
             f.write(response.text)
     
+    # 워커 프로세스와 큐 초기화
+    request_queues = [Queue() for _ in range(NUM_WORKERS)]
+    
     # 워커 프로세스 시작
     for queue in request_queues:
         p = Process(target=worker_process, args=(queue,))
+        p.daemon = True  # 메인 프로세스가 종료되면 자동으로 종료되도록 설정
         p.start()
         processes.append(p)
+
+def cleanup_workers():
+    """서버 종료 시 정리 작업을 수행합니다."""
+    global processes, request_queues
+    
+    # 워커 프로세스들에게 종료 시그널 전송
+    for queue in request_queues:
+        try:
+            if not queue._closed:
+                queue.put(None)
+        except (ValueError, AttributeError):
+            continue
+    
+    # 모든 프로세스 종료 대기
+    for p in processes:
+        try:
+            if p.is_alive():
+                p.join(timeout=1)
+                if p.is_alive():
+                    p.terminate()
+        except:
+            continue
+
+def signal_handler(signum, frame):
+    """시그널 핸들러"""
+    cleanup_workers()
+    os._exit(0)
+
+# 시그널 핸들러 등록
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 app = Flask(__name__)
 
@@ -122,47 +158,38 @@ def predict():
     if not image_url:
         return jsonify({"error": "이미지 URL이 필요합니다."}), 400
     
-    # 가장 적은 대기열을 가진 큐 선택
-    selected_queue = min(request_queues, key=lambda q: q.qsize())
-    
-    # 이미지 URL을 큐에 추가
-    selected_queue.put(image_url)
-    
-    # 결과 대기
-    result = selected_queue.get()
-    
-    if result.get("success", False):
-        return jsonify({
-            "predictions": result["predictions"],
-            "device_info": {
-                "name": torch.cuda.get_device_name(),
-                "capability": torch.cuda.get_device_capability(),
-                "memory_allocated": f"{torch.cuda.memory_allocated()/1024**2:.2f}MB",
-                "memory_cached": f"{torch.cuda.memory_reserved()/1024**2:.2f}MB"
-            }
-        })
-    else:
-        return jsonify({"error": result.get("error", "알 수 없는 오류가 발생했습니다.")}), 500
-
-@app.teardown_appcontext
-def cleanup(exception=None):
-    """서버 종료 시 정리 작업을 수행합니다."""
-    # 워커 프로세스들에게 종료 시그널 전송
-    for queue in request_queues:
-        queue.put(None)
-    
-    # 모든 프로세스 종료 대기
-    for p in processes:
-        p.join()
-    
-    # 큐 정리
-    for queue in request_queues:
-        queue.close()
-    response_queue.close()
+    try:
+        # 가장 적은 대기열을 가진 큐 선택
+        selected_queue = min(request_queues, key=lambda q: q.qsize())
+        
+        # 이미지 URL을 큐에 추가
+        selected_queue.put(image_url)
+        
+        # 결과 대기
+        result = selected_queue.get()
+        
+        if result.get("success", False):
+            return jsonify({
+                "predictions": result["predictions"],
+                "device_info": {
+                    "name": torch.cuda.get_device_name(),
+                    "capability": torch.cuda.get_device_capability(),
+                    "memory_allocated": f"{torch.cuda.memory_allocated()/1024**2:.2f}MB",
+                    "memory_cached": f"{torch.cuda.memory_reserved()/1024**2:.2f}MB"
+                }
+            })
+        else:
+            return jsonify({"error": result.get("error", "알 수 없는 오류가 발생했습니다.")}), 500
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     # 워커 초기화
     initialize_workers()
+    
+    # 종료 시 정리 작업 등록
+    atexit.register(cleanup_workers)
     
     # 서버 실행
     app.run(host=args.host, port=args.port, threaded=True) 

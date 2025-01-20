@@ -11,6 +11,7 @@ from typing import List
 import numpy as np
 import torch.cuda.amp  # Mixed Precision 추가
 import argparse
+import time
 
 def parse_args():
     parser = argparse.ArgumentParser(description='FastAPI 기반 GPU 병렬 추론 서버')
@@ -77,12 +78,15 @@ async def load_image_from_url(url: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"이미지를 불러올 수 없습니다: {str(e)}")
 
-def get_available_stream():
-    for i, status in enumerate(stream_status):
-        if not status:
-            stream_status[i] = True
-            return i
-    return -1
+async def get_available_stream():
+    """사용 가능한 스트림을 찾아 반환합니다. 없으면 대기합니다."""
+    while True:
+        for i, status in enumerate(stream_status):
+            if not status:
+                stream_status[i] = True
+                return i
+        # 사용 가능한 스트림이 없으면 비동기 대기
+        await asyncio.sleep(0.1)  # 100ms 대기
 
 async def run_inference_in_stream(image: Image.Image, stream_idx: int):
     with torch.cuda.stream(streams[stream_idx]):
@@ -126,13 +130,11 @@ async def predict(image_url: str):
     Returns:
         dict: 상위 5개 예측 결과와 확률
     """
-    # 스트림 할당
-    stream_idx = get_available_stream()
-    if stream_idx == -1:
-        raise HTTPException(status_code=503, detail="사용 가능한 스트림이 없습니다. 잠시 후 다시 시도해주세요.")
-    
     # 이미지 로딩
     image = await load_image_from_url(image_url)
+    
+    # 스트림 할당 (사용 가능한 스트림이 없으면 대기)
+    stream_idx = await get_available_stream()
     
     # 추론 실행
     results = await run_inference_in_stream(image, stream_idx)
