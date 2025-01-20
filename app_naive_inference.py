@@ -11,6 +11,7 @@ import os
 import argparse
 import atexit
 import signal
+import time
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Flask 기반 멀티프로세스 추론 서버')
@@ -158,31 +159,37 @@ def predict():
     if not image_url:
         return jsonify({"error": "이미지 URL이 필요합니다."}), 400
     
-    try:
-        # 가장 적은 대기열을 가진 큐 선택
-        selected_queue = min(request_queues, key=lambda q: q.qsize())
-        
-        # 이미지 URL을 큐에 추가
-        selected_queue.put(image_url)
-        
-        # 결과 대기
-        result = selected_queue.get()
-        
-        if result.get("success", False):
-            return jsonify({
-                "predictions": result["predictions"],
-                "device_info": {
-                    "name": torch.cuda.get_device_name(),
-                    "capability": torch.cuda.get_device_capability(),
-                    "memory_allocated": f"{torch.cuda.memory_allocated()/1024**2:.2f}MB",
-                    "memory_cached": f"{torch.cuda.memory_reserved()/1024**2:.2f}MB"
-                }
-            })
-        else:
-            return jsonify({"error": result.get("error", "알 수 없는 오류가 발생했습니다.")}), 500
+    while True:
+        try:
+            # 가장 적은 대기열을 가진 큐 선택
+            selected_queue = min(request_queues, key=lambda q: q.qsize())
             
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            # 모든 큐가 너무 바쁜지 확인 (예: 큐 크기가 100 이상)
+            if selected_queue.qsize() >= 100:
+                time.sleep(0.1)  # 100ms 대기
+                continue
+            
+            # 이미지 URL을 큐에 추가
+            selected_queue.put(image_url)
+            
+            # 결과 대기
+            result = selected_queue.get()
+            
+            if result.get("success", False):
+                return jsonify({
+                    "predictions": result["predictions"],
+                    "device_info": {
+                        "name": torch.cuda.get_device_name(),
+                        "capability": torch.cuda.get_device_capability(),
+                        "memory_allocated": f"{torch.cuda.memory_allocated()/1024**2:.2f}MB",
+                        "memory_cached": f"{torch.cuda.memory_reserved()/1024**2:.2f}MB"
+                    }
+                })
+            else:
+                return jsonify({"error": result.get("error", "알 수 없는 오류가 발생했습니다.")}), 500
+                
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     # 워커 초기화
