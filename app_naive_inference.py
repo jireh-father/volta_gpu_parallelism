@@ -5,14 +5,13 @@ from PIL import Image
 import requests
 from io import BytesIO
 from flask import Flask, request, jsonify
-from multiprocessing import Process, Value, cpu_count
+from multiprocessing import Process, Queue, Value, current_process
 import numpy as np
 import os
 import argparse
 import atexit
 import signal
 import time
-import ctypes
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Flask 기반 멀티프로세스 추론 서버')
@@ -34,62 +33,99 @@ transform = transforms.Compose([
                        std=[0.229, 0.224, 0.225])
 ])
 
-class InferenceModel:
-    def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = self._load_model()
-        self.busy = Value(ctypes.c_bool, False)
-        
-        # ImageNet 클래스 로드
-        with open('imagenet_classes.txt', 'r') as f:
-            self.categories = [s.strip() for s in f.readlines()]
+def load_model():
+    """모델을 로드하고 최적화합니다."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = torchvision.models.efficientnet_b0(pretrained=True)
+    model.eval()
+    model.to(device)
     
-    def _load_model(self):
-        model = torchvision.models.efficientnet_b0(pretrained=True)
-        model.eval()
-        model.to(self.device)
-        
-        # FP16 변환 (VOLTA 이상)
-        if torch.cuda.get_device_capability()[0] >= 7:
-            model = model.half()
-        
-        return model
+    # FP16 변환 (VOLTA 이상)
+    if torch.cuda.get_device_capability()[0] >= 7:
+        model = model.half()
     
-    def infer(self, image_url: str):
+    return model, device
+
+def worker_process(worker_id: int, request_queue: Queue, response_queue: Queue):
+    """각 워커 프로세스에서 실행되는 함수"""
+    print(f"Worker {worker_id} initializing...")
+    
+    # 모델과 디바이스 초기화
+    model, device = load_model()
+    
+    # ImageNet 클래스 로드
+    with open('imagenet_classes.txt', 'r') as f:
+        categories = [s.strip() for s in f.readlines()]
+    
+    print(f"Worker {worker_id} ready!")
+    
+    while True:
         try:
-            # 이미지 다운로드 및 전처리
-            response = requests.get(image_url)
-            image = Image.open(BytesIO(response.content)).convert('RGB')
-            img_tensor = transform(image).unsqueeze(0).to(self.device)
+            # 요청 대기
+            request = request_queue.get()
+            if request is None:  # 종료 신호
+                break
+                
+            image_url = request["url"]
+            task_id = request["task_id"]
             
-            # FP16 변환 (VOLTA 이상)
-            if torch.cuda.get_device_capability()[0] >= 7:
-                img_tensor = img_tensor.half()
-            
-            # 추론
-            with torch.no_grad(), torch.cuda.amp.autocast():
-                output = self.model(img_tensor)
-            
-            # 결과 처리
-            probabilities = torch.nn.functional.softmax(output[0].float(), dim=0)
-            top5_prob, top5_catid = torch.topk(probabilities, 5)
-            
-            results = []
-            for i in range(top5_prob.size(0)):
-                results.append({
-                    "category": self.categories[top5_catid[i]],
-                    "probability": float(top5_prob[i])
+            try:
+                # 이미지 다운로드 및 전처리
+                response = requests.get(image_url)
+                image = Image.open(BytesIO(response.content)).convert('RGB')
+                img_tensor = transform(image).unsqueeze(0).to(device)
+                
+                # FP16 변환 (VOLTA 이상)
+                if torch.cuda.get_device_capability()[0] >= 7:
+                    img_tensor = img_tensor.half()
+                
+                # 추론
+                with torch.no_grad(), torch.cuda.amp.autocast():
+                    output = model(img_tensor)
+                
+                # 결과 처리
+                probabilities = torch.nn.functional.softmax(output[0].float(), dim=0)
+                top5_prob, top5_catid = torch.topk(probabilities, 5)
+                
+                results = []
+                for i in range(top5_prob.size(0)):
+                    results.append({
+                        "category": categories[top5_catid[i]],
+                        "probability": float(top5_prob[i])
+                    })
+                
+                response_queue.put({
+                    "task_id": task_id,
+                    "success": True,
+                    "worker_id": worker_id,
+                    "predictions": results,
+                    "device_info": {
+                        "name": torch.cuda.get_device_name(),
+                        "capability": torch.cuda.get_device_capability(),
+                        "memory_allocated": f"{torch.cuda.memory_allocated()/1024**2:.2f}MB",
+                        "memory_cached": f"{torch.cuda.memory_reserved()/1024**2:.2f}MB"
+                    }
+                })
+                
+            except Exception as e:
+                response_queue.put({
+                    "task_id": task_id,
+                    "success": False,
+                    "worker_id": worker_id,
+                    "error": str(e)
                 })
             
-            return {"success": True, "predictions": results}
-            
+            finally:
+                torch.cuda.empty_cache()
+                
         except Exception as e:
-            return {"success": False, "error": str(e)}
-        finally:
-            torch.cuda.empty_cache()
+            print(f"Worker {worker_id} error: {str(e)}")
+            continue
 
-# 모델 인스턴스들을 저장할 리스트
-models = []
+# 프로세스와 큐 초기화
+processes = []
+request_queues = []
+response_queue = Queue()
 
 app = Flask(__name__)
 
@@ -111,37 +147,48 @@ def predict():
     if not image_url:
         return jsonify({"error": "이미지 URL이 필요합니다."}), 400
     
+    # 가장 적은 대기열을 가진 큐 선택
+    selected_queue = min(request_queues, key=lambda q: q.qsize())
+    task_id = f"{time.time()}-{os.getpid()}"
+    
+    # 요청 전송
+    selected_queue.put({"url": image_url, "task_id": task_id})
+    
+    # 응답 대기
     while True:
-        # 사용 가능한 모델 찾기
-        for model in models:
-            if not model.busy.value:
-                with model.busy.get_lock():
-                    if not model.busy.value:  # Double-check
-                        model.busy.value = True
-                        try:
-                            result = model.infer(image_url)
-                            if result["success"]:
-                                return jsonify({
-                                    "predictions": result["predictions"],
-                                    "worker_id": models.index(model),
-                                    "device_info": {
-                                        "name": torch.cuda.get_device_name(),
-                                        "capability": torch.cuda.get_device_capability(),
-                                        "memory_allocated": f"{torch.cuda.memory_allocated()/1024**2:.2f}MB",
-                                        "memory_cached": f"{torch.cuda.memory_reserved()/1024**2:.2f}MB"
-                                    }
-                                })
-                            else:
-                                return jsonify({"error": result["error"]}), 500
-                        finally:
-                            model.busy.value = False
-        
-        # 사용 가능한 모델이 없으면 잠시 대기
-        time.sleep(0.1)
+        response = response_queue.get()
+        if response["task_id"] == task_id:
+            if response["success"]:
+                return jsonify({
+                    "predictions": response["predictions"],
+                    "worker_id": response["worker_id"],
+                    "device_info": response["device_info"]
+                })
+            else:
+                return jsonify({"error": response["error"]}), 500
+        else:
+            # 다른 태스크의 응답이면 다시 큐에 넣기
+            response_queue.put(response)
+            time.sleep(0.1)
+
+def cleanup():
+    """서버 종료 시 정리 작업을 수행합니다."""
+    print("Cleaning up...")
+    # 워커 프로세스들에게 종료 신호 전송
+    for q in request_queues:
+        q.put(None)
+    
+    # 프로세스 종료 대기
+    for p in processes:
+        p.join(timeout=1)
+        if p.is_alive():
+            p.terminate()
+    
+    print("Cleanup complete!")
 
 def initialize():
     """서버 시작 시 초기화 작업을 수행합니다."""
-    global models
+    global processes, request_queues
     
     # ImageNet 클래스 파일 다운로드 (없는 경우)
     if not os.path.exists('imagenet_classes.txt'):
@@ -150,11 +197,16 @@ def initialize():
         with open('imagenet_classes.txt', 'w') as f:
             f.write(response.text)
     
-    # 모델 인스턴스들 초기화
+    # 워커 프로세스 시작
     for i in range(NUM_WORKERS):
-        print(f"Loading model {i+1}/{NUM_WORKERS}...")
-        models.append(InferenceModel())
-    print("All models loaded successfully!")
+        request_queue = Queue()
+        request_queues.append(request_queue)
+        p = Process(target=worker_process, args=(i, request_queue, response_queue))
+        p.start()
+        processes.append(p)
+    
+    # 종료 시 정리 작업 등록
+    atexit.register(cleanup)
 
 if __name__ == '__main__':
     # 초기화 실행
