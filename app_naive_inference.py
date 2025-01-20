@@ -139,7 +139,6 @@ def predict():
         # 사용 가능한 모델이 없으면 잠시 대기
         time.sleep(0.1)
 
-@app.before_first_request
 def initialize():
     """서버 시작 시 초기화 작업을 수행합니다."""
     global models
@@ -152,9 +151,14 @@ def initialize():
             f.write(response.text)
     
     # 모델 인스턴스들 초기화
-    for _ in range(NUM_WORKERS):
+    for i in range(NUM_WORKERS):
+        print(f"Loading model {i+1}/{NUM_WORKERS}...")
         models.append(InferenceModel())
+    print("All models loaded successfully!")
 
 if __name__ == '__main__':
+    # 초기화 실행
+    initialize()
+    
     # 서버 실행
     app.run(host=args.host, port=args.port, threaded=True) 
