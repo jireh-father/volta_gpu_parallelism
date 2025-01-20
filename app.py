@@ -161,6 +161,7 @@ async def startup_event():
     
     # 모델 인스턴스들 초기화
     for _ in range(NUM_WORKERS):
+        print(f"Loading model {_}...")
         model = load_model()
         stream = torch.cuda.Stream()
         model_instances.append(ModelInstance(model=model, stream=stream))
