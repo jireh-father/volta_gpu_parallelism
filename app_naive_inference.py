@@ -189,6 +189,8 @@ def predict():
                 return jsonify({"error": result.get("error", "알 수 없는 오류가 발생했습니다.")}), 500
                 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
