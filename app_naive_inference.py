@@ -21,6 +21,28 @@ def parse_args():
 args = parse_args()
 NUM_WORKERS = args.num_workers  # 사용자 지정 워커 수 사용
 
+# 워커 프로세스와 큐 초기화
+request_queues = [Queue() for _ in range(NUM_WORKERS)]
+response_queue = Queue()
+processes = []
+
+def initialize_workers():
+    """워커 프로세스들을 초기화합니다."""
+    global processes
+    
+    # ImageNet 클래스 파일 다운로드 (없는 경우)
+    if not os.path.exists('imagenet_classes.txt'):
+        url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
+        response = requests.get(url)
+        with open('imagenet_classes.txt', 'w') as f:
+            f.write(response.text)
+    
+    # 워커 프로세스 시작
+    for queue in request_queues:
+        p = Process(target=worker_process, args=(queue,))
+        p.start()
+        processes.append(p)
+
 app = Flask(__name__)
 
 # 이미지 전처리 파이프라인
@@ -93,29 +115,6 @@ def worker_process(queue):
         # 메모리 정리
         torch.cuda.empty_cache()
 
-# 워커 프로세스와 큐 초기화
-request_queues = [Queue() for _ in range(NUM_WORKERS)]
-response_queue = Queue()
-processes = []
-
-@app.before_first_request
-def initialize_workers():
-    """서버 시작 시 워커 프로세스들을 초기화합니다."""
-    global processes
-    
-    # ImageNet 클래스 파일 다운로드 (없는 경우)
-    if not os.path.exists('imagenet_classes.txt'):
-        url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
-        response = requests.get(url)
-        with open('imagenet_classes.txt', 'w') as f:
-            f.write(response.text)
-    
-    # 워커 프로세스 시작
-    for queue in request_queues:
-        p = Process(target=worker_process, args=(queue,))
-        p.start()
-        processes.append(p)
-
 @app.route('/predict', methods=['GET'])
 def predict():
     """이미지 URL을 받아 추론을 수행합니다."""
@@ -162,5 +161,8 @@ def cleanup(exception=None):
     response_queue.close()
 
 if __name__ == '__main__':
+    # 워커 초기화
+    initialize_workers()
+    
     # 서버 실행
     app.run(host=args.host, port=args.port, threaded=True) 
