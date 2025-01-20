@@ -43,3 +43,4 @@ ENV/
 
 # Dataset
 data/ 
+.history/
