@@ -177,7 +177,7 @@ def predict():
             
             # 결과가 문자열인 경우 (에러 메시지)
             if isinstance(result, str):
-                print(f"Error: {result}")
+                print(f"Error: {result}", flush=True)
                 return jsonify({"error": result}), 500
             
             # 결과가 딕셔너리인 경우 (정상 결과)
